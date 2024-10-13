@@ -1,10 +1,8 @@
-import os
 import pandas as pd
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_score
-from sklearn.metrics import f1_score, make_scorer
 from tqdm import tqdm
 import re
 
@@ -36,9 +34,10 @@ def prepare_data(features_df, labels_df):
     merged_df = pd.merge(features_df[['uid', 'processed_narrative']], labels_df, on='uid', how='inner')
     return merged_df
 
-def create_tfidf_features(texts, max_features=5000):
+def create_tfidf_features(texts, max_features=10000):
     """Create TF-IDF features from preprocessed texts using CountVectorizer."""
-    vectorizer = TfidfVectorizer(max_features=max_features, stop_words='english')  # Using built-in stop words
+    # vectorizer = TfidfVectorizer(max_features=max_features, stop_words='english')  # Using built-in stop words
+    vectorizer = TfidfVectorizer(max_features=max_features, stop_words='english', ngram_range=(1, 2))  # Using bigrams
     return vectorizer.fit_transform(texts), vectorizer
 
 def train_and_evaluate_model(X, y):
@@ -47,8 +46,11 @@ def train_and_evaluate_model(X, y):
     scores = []
 
     for col in tqdm(y.columns, desc="Training models"):
-        model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-        score = cross_val_score(model, X, y[col], cv=5, scoring='f1_micro').mean()
+        # model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1, class_weight='balanced')
+        # score = cross_val_score(model, X, y[col], cv=5, scoring='f1_micro').mean()
+        score = cross_val_score(model, X, y[col], cv=3, scoring='f1_micro').mean()
+
         model.fit(X, y[col])  # Fit the model on all data
         models.append(model)
         scores.append(score)
