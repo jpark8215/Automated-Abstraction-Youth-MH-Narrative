@@ -1,8 +1,12 @@
+
 import pandas as pd
 import numpy as np
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier
-from sklearn.model_selection import cross_val_score
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier, GradientBoostingClassifier
+from sklearn.metrics import f1_score, confusion_matrix
+from sklearn.model_selection import cross_val_score, GridSearchCV, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 from textblob import TextBlob
 from tqdm import tqdm
@@ -11,28 +15,14 @@ import xgboost as xgb
 
 # Mapping dictionaries for categorical columns
 injury_location_mapping = {
-    1: 1,
-    2: 2,
-    3: 3,
-    4: 4,
-    5: 5,
-    6: 6
+    1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6
 }
 
 weapon_type_mapping = {
-    1: 1,
-    2: 2,
-    3: 3,
-    4: 4,
-    5: 5,
-    6: 6,
-    7: 7,
-    8: 8,
-    9: 9,
-    10: 10,
-    11: 11,
-    12: 12
+    1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6,
+    7: 7, 8: 8, 9: 9, 10: 10, 11: 11, 12: 12
 }
+
 
 # # Define your keyword mappings here
 # keyword_mappings = {
@@ -89,7 +79,7 @@ weapon_type_mapping = {
 def preprocess_text(text):
     """Preprocess text by converting to lowercase, removing special characters."""
     text = str(text).lower()
-    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'[^a-z0-9\w\s]', '', text)
     return text
 
 
@@ -129,20 +119,29 @@ def prepare_data(features_df, labels_df):
     #     features_df[key] = 0  # Default to 0
 
     labels_df = map_categorical_columns(labels_df)
-    merged_df = pd.merge(features_df[['uid', 'processed_narrative', 'sentiment']], labels_df, on='uid', how='inner')
+    merged_df = pd.merge(features_df[['uid', 'processed_narrative', 'sentiment']], labels_df,
+                         on='uid', how='inner')
     return merged_df
 
 
 def create_tfidf_features(texts, max_features=25000):
-    """Create TF-IDF features from preprocessed texts."""
-    vectorizer = TfidfVectorizer(max_features=max_features, stop_words='english', ngram_range=(1, 3))
+    vectorizer = TfidfVectorizer(
+        max_features=max_features,
+        stop_words='english',
+        ngram_range=(1, 3),
+        min_df=3,
+        max_df=0.9,
+        sublinear_tf=True
+    )
     return vectorizer.fit_transform(texts), vectorizer
 
 
 def train_and_evaluate_model(X, y):
-    """Train an ensemble model for each label and evaluate using cross-validation."""
+    """Enhanced model training with confusion matrix analysis."""
     models = []
     scores = []
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
     for col in tqdm(y.columns, desc="Training models"):
         label_encoder = LabelEncoder()
@@ -152,21 +151,81 @@ def train_and_evaluate_model(X, y):
             print(f"Skipping {col} due to insufficient class samples.")
             continue
 
-        class_weight = {0: 1, 1: 2}
-        # rf_model = RandomForestClassifier(n_estimators=120, random_state=42, n_jobs=-1, class_weight='balanced')
-        rf_model = RandomForestClassifier(n_estimators=120, random_state=42, n_jobs=-1, class_weight=class_weight)
-        xgb_model = xgb.XGBClassifier(eval_metric='mlogloss', random_state=42)
-        ensemble_model = VotingClassifier(estimators=[('rf', rf_model), ('xgb', xgb_model)], voting='soft')
+        # Calculate class weights
+        class_counts = np.bincount(y_encoded)
+        class_weight = {i: len(y_encoded) / (len(np.unique(y_encoded)) * count)
+                        for i, count in enumerate(class_counts)}
 
-        ensemble_score = cross_val_score(ensemble_model, X, y_encoded, cv=3, scoring='f1_micro').mean()
-        ensemble_model.fit(X, y_encoded)
-        models.append((ensemble_model, label_encoder))
-        scores.append(ensemble_score)
-        print(f"Ensemble model F1 score for {col}: {ensemble_score * 100:.2f}%")
+        # Define base models with optimized parameters
+        rf_model = RandomForestClassifier(
+            n_estimators=300,
+            max_depth=20,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            class_weight=class_weight,
+            random_state=42,
+            n_jobs=-1
+        )
 
-    avg_score = np.mean(scores)
-    print(f"Average F1 score across all labels: {avg_score * 100:.2f}%")
-    return models, avg_score
+        xgb_model = xgb.XGBClassifier(
+            n_estimators=300,
+            max_depth=8,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            scale_pos_weight=class_counts[0] / class_counts[1],
+            random_state=42
+        )
+
+        # gb_model = GradientBoostingClassifier(
+        #     n_estimators=200,
+        #     max_depth=8,
+        #     learning_rate=0.1,
+        #     subsample=0.8,
+        #     random_state=42
+        # )
+
+        # Create SMOTE pipeline
+        pipeline = Pipeline([
+            # ('smote', SMOTE(random_state=42)),
+            ('ensemble', VotingClassifier(
+                estimators=[
+                    ('rf', rf_model),
+                    ('xgb', xgb_model),
+                    # ('gb', gb_model)
+                ],
+                voting='soft'
+            ))
+        ])
+
+        # Perform cross-validation
+        cv_scores = []
+        confusion_matrices = []
+
+        for train_idx, val_idx in skf.split(X.toarray(), y_encoded):
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y_encoded[train_idx], y_encoded[val_idx]
+
+            pipeline.fit(X_train, y_train)
+            y_pred = pipeline.predict(X_val)
+
+            cv_scores.append(f1_score(y_val, y_pred, average='weighted'))
+            confusion_matrices.append(confusion_matrix(y_val, y_pred))
+
+        # Print metrics
+        avg_score = np.mean(cv_scores)
+        print(f"\nMetrics for {col}:")
+        print(f"Average F1 Score: {avg_score:.4f}")
+        print("\nAverage Confusion Matrix:")
+        avg_conf_matrix = np.mean(confusion_matrices, axis=0)
+        print(avg_conf_matrix)
+
+        # Fit final model on full dataset
+        pipeline.fit(X.toarray(), y_encoded)
+        models.append((pipeline, label_encoder))
+        scores.append(avg_score)
+
+    return models, np.mean(scores)
 
 
 def make_predictions(models, X):
@@ -177,46 +236,6 @@ def make_predictions(models, X):
         pred = label_encoder.inverse_transform(pred)
         predictions.append(pred)
     return np.column_stack(predictions)
-
-
-def adjust_predictions_based_on_keywords(df, predictions, keyword_mappings, boolean_keywords):
-    """Adjust predictions based on narrative content for injury locations, weapon types, and boolean flags."""
-    adjusted_predictions = predictions.copy()
-
-    # Check if 'InjuryLocationType' and 'WeaponType1' exist in predictions
-    injury_location_col = 'InjuryLocationType'
-    weapon_type_col = 'WeaponType1'
-
-    if injury_location_col not in df.columns or weapon_type_col not in df.columns:
-        print(f"Warning: Columns {injury_location_col} or {weapon_type_col} do not exist in DataFrame.")
-        return adjusted_predictions
-
-    # Loop through each narrative
-    for i, narrative in enumerate(df['processed_narrative']):
-        # Check for injury location keywords
-        for keywords, code in keyword_mappings['injury_location'].items():
-            if re.search(keywords, narrative):
-                adjusted_predictions[i, df.columns.get_loc(injury_location_col)] = code
-
-        # Check for weapon type keywords
-        for keywords, code in keyword_mappings['weapon_type'].items():
-            if re.search(keywords, narrative):
-                adjusted_predictions[i, df.columns.get_loc(weapon_type_col)] = code
-
-        # Set boolean flags based on keyword matches
-        for column, keywords in boolean_keywords.items():
-            if re.search(keywords, narrative):
-                if column not in df.columns:
-                    print(f"Warning: Column {column} does not exist in DataFrame. Skipping...")
-                    continue
-                adjusted_predictions[i, df.columns.get_loc(column)] = 1
-            else:
-                if column not in df.columns:
-                    print(f"Warning: Column {column} does not exist in DataFrame. Skipping...")
-                    continue
-                adjusted_predictions[i, df.columns.get_loc(column)] = 0
-
-    return adjusted_predictions
 
 
 def save_submission(predictions, uids, columns, output_file):
@@ -257,9 +276,6 @@ def main():
 
     print("Making predictions...")
     predictions = make_predictions(models, X_test)
-    # # Adjust predictions based on keyword mappings
-    # predictions = adjust_predictions_based_on_keywords(test_features_df, predictions, keyword_mappings,
-    #                                                    boolean_keywords)
 
     submission_format_df = pd.read_csv(submission_format_file, index_col='uid')
     save_submission(predictions, test_features_df['uid'], submission_format_df.columns, output_submission_file)
