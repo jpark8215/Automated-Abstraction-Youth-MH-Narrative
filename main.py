@@ -1,4 +1,3 @@
-
 import pandas as pd
 import numpy as np
 from imblearn.over_sampling import SMOTE
@@ -6,7 +5,7 @@ from imblearn.pipeline import Pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier, GradientBoostingClassifier
 from sklearn.metrics import f1_score, confusion_matrix
-from sklearn.model_selection import cross_val_score, GridSearchCV, StratifiedKFold
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 from textblob import TextBlob
 from tqdm import tqdm
@@ -22,58 +21,6 @@ weapon_type_mapping = {
     1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6,
     7: 7, 8: 8, 9: 9, 10: 10, 11: 11, 12: 12
 }
-
-
-# # Define your keyword mappings here
-# keyword_mappings = {
-#     "injury_location": {
-#         r"house|apartment|condo|flat|home": 1,
-#         r"car|motorcycle|van|truck|vehicle": 2,
-#         r"river|field|beach|wood|forest|park|countryside": 3,
-#         r"park|playground|public space|community": 4,
-#         r"street|road|sidewalk|alley|driveway|highway": 5,
-#         r"unknown|other|not specified": 6
-#     },
-#     "weapon_type": {
-#         r"hammer|wrench|pipe|stick|bat|scissors|tool": 1,
-#         r"drowning|water|submersion": 2,
-#         r"fall|trip|slip|accidental fall": 3,
-#         r"fire|burns|explosion|flame": 4,
-#         r"firearm|gun|shot|pistol|revolver|rifle": 5,
-#         r"hanging|strangul|suffocat|asphyxiat": 6,
-#         r"motor|vehicle|bus|motorcycle|car": 7,
-#         r"train|plane|boat|aircraft": 8,
-#         r"poison|overdose|toxic|substance": 9,
-#         r"sharp|knife|blade|sword|scissors|cutting tool": 10,
-#         r"taser|elect|nail gun|stun gun": 11,
-#         r"unknown|unspecified|not known": 12
-#     }
-# }
-#
-# # Define boolean keywords
-# boolean_keywords = {
-#     "DepressedMood": r"depress|sad|unhappy",
-#     "MentalIllnessTreatmentCurrnt": r"current treatment|current therapy|ongoing treatment|current counseling|present treatment",
-#     "HistoryMentalIllnessTreatmnt": r"previous treatment|past treatment|former treatment|prior counseling|previous therapy",
-#     "SuicideAttemptHistory": r"attempted suicide|suicide attempt|tried to kill|self-harm",
-#     "SuicideThoughtHistory": r"suicidal thought|suicidal plan|thoughts of suicide|considering suicide|suicidal ideation",
-#     "SubstanceAbuseProblem": r"substance|alcohol|drug|addiction|dependency",
-#     "MentalHealthProblem": r"mental health|diagnos|psychological issue|psychological disorder",
-#     "DiagnosisAnxiety": r"anxiety|anxious|panic|nervous|worry",
-#     "DiagnosisDepressionDysthymia": r"depress|dysthymia|major depressive|depressive disorder|chronic depression",
-#     "DiagnosisBipolar": r"bipolar|manic|mood swings|manic depressive",
-#     "DiagnosisAdhd": r"adhd|attention deficit|hyperactivity|attention deficit hyperactivity disorder",
-#     "IntimatePartnerProblem": r"partner problem|relationship issue|domestic dispute|intimate partner violence",
-#     "FamilyRelationship": r"family conflict|domestic issue|family issue|family problems|home conflict",
-#     "Argument": r"argu|disput|fight|quarrel|altercat",
-#     "SchoolProblem": r"school issue|academic problem|educational issue|school conflict",
-#     "RecentCriminalLegalProblem": r"criminal|legal issue|arrest|conviction|charge|legal trouble",
-#     "SuicideNote": r"suicide note|final message|note left behind|last word",
-#     "SuicideIntentDisclosed": r"disclose intent|tell someone about suicide|mention suicide|express suicide",
-#     "DisclosedToIntimatePartner": r"tell partner|partner aware|tell husband|tell wife|share with partner",
-#     "DisclosedToOtherFamilyMember": r"family member aware|tell family|inform family member",
-#     "DisclosedToFriend": r"friend aware|tell friend|inform friend|share with friend"
-# }
 
 
 def preprocess_text(text):
@@ -113,10 +60,6 @@ def prepare_data(features_df, labels_df):
                                           features_df['NarrativeCME'].fillna(''))
     features_df['processed_narrative'] = features_df['processed_narrative'].apply(preprocess_text)
     features_df['sentiment'] = features_df['processed_narrative'].apply(get_sentiment_score)
-
-    # # Initialize columns for boolean flags
-    # for key in boolean_keywords.keys():
-    #     features_df[key] = 0  # Default to 0
 
     labels_df = map_categorical_columns(labels_df)
     merged_df = pd.merge(features_df[['uid', 'processed_narrative', 'sentiment']], labels_df,
@@ -187,7 +130,7 @@ def train_and_evaluate_model(X, y):
 
         # Create SMOTE pipeline
         pipeline = Pipeline([
-            # ('smote', SMOTE(random_state=42)),
+            ('smote', SMOTE(random_state=42)),
             ('ensemble', VotingClassifier(
                 estimators=[
                     ('rf', rf_model),
