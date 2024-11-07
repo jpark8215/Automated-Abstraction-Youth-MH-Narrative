@@ -4,9 +4,9 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from scipy.sparse import csr_matrix
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import f1_score, confusion_matrix, precision_recall_curve
+from sklearn.metrics import f1_score, confusion_matrix, classification_report, balanced_accuracy_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 from textblob import TextBlob
@@ -19,6 +19,7 @@ injury_location_mapping = {
 
 weapon_type_mapping = {i: i for i in range(1, 13)}
 
+
 # weapon_type_mapping = {
 #     1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6,
 #     7: 7, 8: 8, 9: 9, 10: 10, 11: 11, 12: 12
@@ -26,9 +27,18 @@ weapon_type_mapping = {i: i for i in range(1, 13)}
 
 
 def preprocess_text(text):
-    """Preprocess text by converting to lowercase, removing special characters."""
+    """Enhanced text preprocessing with better handling of edge cases."""
+    if pd.isna(text):
+        return ""
     text = str(text).lower()
-    text = re.sub(r'[^a-z0-9\w\s]', '', text)
+    # Remove URLs
+    text = re.sub(r'http\S+|www.\S+', '', text)
+    # Remove email addresses
+    text = re.sub(r'\S+@\S+', '', text)
+    # Remove special characters but keep important punctuation
+    text = re.sub(r'[^a-z0-9\s.,!?]', '', text)
+    # Remove extra whitespace
+    text = ' '.join(text.split())
     return text
 
 
@@ -38,13 +48,20 @@ def get_sentiment_score(text):
 
 
 def load_data(features_file, labels_file=None):
-    """Load feature and label data from CSV files."""
-    features_df = pd.read_csv(features_file)
-    if labels_file is not None:
-        labels_df = pd.read_csv(labels_file)
-        return features_df, labels_df
-    else:
+    """Improved data loading with error handling and type checking."""
+    try:
+        features_df = pd.read_csv(features_file)
+        if labels_file is not None:
+            labels_df = pd.read_csv(labels_file)
+            # Verify uid exists in both dataframes
+            if 'uid' not in features_df.columns or 'uid' not in labels_df.columns:
+                raise ValueError("Missing 'uid' column in features or labels DataFrame")
+            return features_df, labels_df
         return features_df, None
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"Could not find file: {str(e)}")
+    except pd.errors.EmptyDataError:
+        raise ValueError("File is empty")
 
 
 def map_categorical_columns(df):
@@ -112,35 +129,47 @@ def handle_imbalance(X, y, class_counts, sampling_ratio=0.8):
     return X[balanced_indices], y[balanced_indices]
 
 
-def calculate_optimal_threshold(y_true, y_pred_proba):
-    """Calculate optimal threshold to minimize false positives."""
-    precisions, recalls, thresholds = precision_recall_curve(y_true, y_pred_proba)
-    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-7)
-    optimal_idx = np.argmax(f1_scores)
-    return thresholds[optimal_idx] if len(thresholds) > optimal_idx else 0.5
+# def evaluate_predictions(y_true, y_pred, y_pred_proba, column_name):
+#     """Evaluate model predictions with focus on false positives."""
+#     conf_matrix = confusion_matrix(y_true, y_pred)
+#     tn, fp, fn, tp = conf_matrix.ravel()
+#
+#     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+#     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+#     f1 = f1_score(y_true, y_pred, average='binary')
+#     fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+#     fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
+#
+#     print(f"\nMetrics for {column_name}:")
+#     print(f"Confusion Matrix:\n{conf_matrix}")
+#     print(f"Precision: {precision:.4f}")
+#     print(f"Recall: {recall:.4f}")
+#     print(f"F1 Score: {f1:.4f}")
+#     print(f"False Positive Rate (FPR): {fpr:.4f}")
+#     print(f"False Negative Rate (FNR): {fnr:.4f}")
 
 
-def evaluate_predictions(y_true, y_pred, y_pred_proba, column_name):
-    """Evaluate model predictions with focus on false positives."""
-    conf_matrix = confusion_matrix(y_true, y_pred)
-    tn, fp, fn, tp = conf_matrix.ravel()
+def calculate_optimal_threshold(y_true, y_pred_proba, metric='f1'):
+    """Enhanced threshold calculation with multiple metric options."""
+    if y_pred_proba.ndim == 1 or y_pred_proba.shape[1] == 2:
+        # Binary classification
+        thresholds = np.linspace(0, 1, 100)
+        scores = []
+        for threshold in thresholds:
+            y_pred = (y_pred_proba >= threshold).astype(int)
+            if metric == 'f1':
+                score = f1_score(y_true, y_pred)
+            elif metric == 'balanced_accuracy':
+                score = balanced_accuracy_score(y_true, y_pred)
+            scores.append(score)
+        return thresholds[np.argmax(scores)]
+    else:
+        # Multiclass optimization
+        return calculate_optimal_threshold(y_true, y_pred_proba)
 
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = f1_score(y_true, y_pred, average='binary')
-    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
-    fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
-
-    print(f"\nMetrics for {column_name}:")
-    print(f"Confusion Matrix:\n{conf_matrix}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1 Score: {f1:.4f}")
-    print(f"False Positive Rate (FPR): {fpr:.4f}")
-    print(f"False Negative Rate (FNR): {fnr:.4f}")
 
 def train_and_evaluate_model(X, y):
-    """Enhanced model training with focus on reducing false positives."""
+    """Enhanced model training with both XGBoost and Random Forest models."""
     models = []
     scores = []
 
@@ -154,8 +183,9 @@ def train_and_evaluate_model(X, y):
 
         label_encoder = LabelEncoder()
         y_encoded = label_encoder.fit_transform(y[col])
+        n_classes = len(np.unique(y_encoded))
 
-        if len(np.unique(y_encoded)) < 2:
+        if n_classes < 2:
             print(f"Skipping {col} due to insufficient class samples.")
             continue
 
@@ -166,7 +196,7 @@ def train_and_evaluate_model(X, y):
             for i, count in enumerate(class_counts_encoded)
         }
 
-        # Define base models
+        # Define models
         rf_model = RandomForestClassifier(
             n_estimators=200,
             max_depth=15,
@@ -183,18 +213,12 @@ def train_and_evaluate_model(X, y):
             learning_rate=0.05,
             subsample=0.7,
             colsample_bytree=0.7,
-            scale_pos_weight=(len(y_encoded) / sum(y_encoded)) if len(np.unique(y_encoded)) == 2 else 1,
-            # scale_pos_weight=class_counts_encoded[0] / class_counts_encoded[1] if len(class_counts_encoded) == 2 else 1,
-            random_state=42
+            random_state=42,
+            objective='binary:logistic' if n_classes == 2 else 'multi:softprob',
+            num_class=n_classes if n_classes > 2 else None
         )
 
-        gb_model = GradientBoostingClassifier(
-            n_estimators=200,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.7,
-            random_state=42
-        )
+        models_list = [rf_model, xgb_model]
 
         # Perform cross-validation
         cv_scores = []
@@ -205,7 +229,7 @@ def train_and_evaluate_model(X, y):
             y_train, y_val = y_encoded[train_idx], y_encoded[val_idx]
 
             # Handle imbalance if binary classification
-            if len(np.unique(y_encoded)) == 2 and imbalance_ratio > 3:
+            if n_classes == 2 and imbalance_ratio > 3:
                 X_train_dense = X_train.toarray()
                 X_train_balanced, y_train_balanced = handle_imbalance(
                     X_train_dense,
@@ -215,29 +239,37 @@ def train_and_evaluate_model(X, y):
                 X_train = csr_matrix(X_train_balanced)
                 y_train = y_train_balanced.values
 
-            # Train models
-            models_list = [rf_model, xgb_model, gb_model]
+            # Train models and get predictions
             predictions_proba = []
-
             for model in models_list:
                 model.fit(X_train, y_train)
-                if hasattr(model, 'predict_proba'):
+                if n_classes == 2:
                     pred_proba = model.predict_proba(X_val)[:, 1]
+                    predictions_proba.append(pred_proba)
+                else:
+                    pred_proba = model.predict_proba(X_val)
                     predictions_proba.append(pred_proba)
 
             # Ensemble predictions
-            if predictions_proba:
+            if n_classes == 2:
+                # For binary classification
                 y_pred_proba = np.mean(predictions_proba, axis=0)
                 threshold = calculate_optimal_threshold(y_val, y_pred_proba)
-                thresholds.append(threshold)
                 y_pred = (y_pred_proba >= threshold).astype(int)
+                thresholds.append(threshold)
             else:
-                y_pred = rf_model.predict(X_val)
+                # For multiclass
+                y_pred_proba = np.mean(predictions_proba, axis=0)
+                y_pred = np.argmax(y_pred_proba, axis=1)
 
+            # Calculate and store scores
             cv_scores.append(f1_score(y_val, y_pred, average='weighted'))
 
-            if len(np.unique(y_encoded)) == 2:
-                evaluate_predictions(y_val, y_pred, y_pred_proba, col)
+            # Evaluate predictions
+            print(f"\nCross-validation fold results:")
+            print(classification_report(y_val, y_pred))
+            print("\nConfusion Matrix:")
+            print(confusion_matrix(y_val, y_pred))
 
         # Train final models on full dataset
         final_models = []
@@ -245,9 +277,14 @@ def train_and_evaluate_model(X, y):
             model.fit(X.toarray(), y_encoded)
             final_models.append(model)
 
+        if len(final_models) == 1:
+            final_models = final_models[0]  # If only one model, don't wrap in a list
+
         final_threshold = np.mean(thresholds) if thresholds else None
         models.append((final_models, label_encoder, final_threshold))
         scores.append(np.mean(cv_scores))
+
+        print(f"\nAverage CV Score for {col}: {np.mean(cv_scores):.4f}")
 
     return models, np.mean(scores)
 
@@ -255,20 +292,28 @@ def train_and_evaluate_model(X, y):
 def make_predictions(models, X):
     """Make predictions using the trained models."""
     predictions = []
-    for model_list, label_encoder, threshold in models:
-        predictions_proba = []
+    for model_tuple in models:
+        model_list, label_encoder, threshold = model_tuple
 
+        if not isinstance(model_list, list):
+            model_list = [model_list]  # Convert single model to list
+
+        predictions_proba = []
         for model in model_list:
             if hasattr(model, 'predict_proba'):
-                pred_proba = model.predict_proba(X)[:, 1]
-                predictions_proba.append(pred_proba)
+                pred_proba = model.predict_proba(X)
+                if pred_proba.shape[1] == 2:  # Binary classification
+                    predictions_proba.append(pred_proba[:, 1])
+                else:  # Multiclass classification
+                    predictions_proba.append(pred_proba)
 
-        if predictions_proba and threshold is not None:
-            # Ensemble predictions for binary classification
+        if predictions_proba:
             y_pred_proba = np.mean(predictions_proba, axis=0)
-            pred = (y_pred_proba >= threshold).astype(int)
+            if y_pred_proba.ndim == 1 or y_pred_proba.shape[1] == 2:  # Binary classification
+                pred = (y_pred_proba >= threshold).astype(int)
+            else:  # Multiclass classification
+                pred = np.argmax(y_pred_proba, axis=1)
         else:
-            # Use random forest for multi-class or when probability is not available
             pred = model_list[0].predict(X)
 
         pred = label_encoder.inverse_transform(pred)
@@ -322,4 +367,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
