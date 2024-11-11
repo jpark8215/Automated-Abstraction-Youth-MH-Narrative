@@ -1,368 +1,254 @@
+import logging
 import re
-
 import numpy as np
 import pandas as pd
-import xgboost as xgb
-from scipy.sparse import csr_matrix
+from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import f1_score, confusion_matrix, classification_report, balanced_accuracy_score
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import LabelEncoder
-from textblob import TextBlob
+from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.multioutput import MultiOutputClassifier
 from tqdm import tqdm
 
-# Mapping dictionaries remain unchanged
-injury_location_mapping = {
-    1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Define categorical columns and their possible values
+CATEGORICAL_COLS = {
+    'InjuryLocationType': range(1, 7),  # 1-6
+    'WeaponType1': range(1, 13)  # 1-12
 }
 
-weapon_type_mapping = {i: i for i in range(1, 13)}
 
-
-# weapon_type_mapping = {
-#     1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6,
-#     7: 7, 8: 8, 9: 9, 10: 10, 11: 11, 12: 12
-# }
+def load_data(features_path, labels_path):
+    logging.info(f"Loading data from {features_path} and {labels_path}")
+    features = pd.read_csv(features_path)
+    labels = pd.read_csv(labels_path)
+    return pd.merge(features, labels, on='uid', how='inner')
 
 
 def preprocess_text(text):
-    """Enhanced text preprocessing with better handling of edge cases."""
     if pd.isna(text):
-        return ""
+        return ''
     text = str(text).lower()
-    # Remove URLs
-    text = re.sub(r'http\S+|www.\S+', '', text)
-    # Remove email addresses
-    text = re.sub(r'\S+@\S+', '', text)
-    # Remove special characters but keep important punctuation
-    text = re.sub(r'[^a-z0-9\s.,!?]', '', text)
-    # Remove extra whitespace
-    text = ' '.join(text.split())
+    # Keep some punctuation that might be meaningful
+    text = re.sub(r'[^a-z0-9\s\.\,\?\!]', '', text)
+    text = re.sub(r'\s\^xxxx+', ' ', text).strip()
     return text
 
 
-def get_sentiment_score(text):
-    """Calculate the sentiment polarity of a text."""
-    return TextBlob(text).sentiment.polarity
+def prepare_data(df):
+    """Prepare data by combining narratives and preprocessing."""
+    df = df.copy()
 
+    # Combine narratives with special separator
+    df['processed_narrative'] = (df['NarrativeLE'].fillna('') +
+                                 ' [SEP] ' +
+                                 df['NarrativeCME'].fillna(''))
 
-def load_data(features_file, labels_file=None):
-    """Improved data loading with error handling and type checking."""
-    try:
-        features_df = pd.read_csv(features_file)
-        if labels_file is not None:
-            labels_df = pd.read_csv(labels_file)
-            # Verify uid exists in both dataframes
-            if 'uid' not in features_df.columns or 'uid' not in labels_df.columns:
-                raise ValueError("Missing 'uid' column in features or labels DataFrame")
-            return features_df, labels_df
-        return features_df, None
-    except FileNotFoundError as e:
-        raise FileNotFoundError(f"Could not find file: {str(e)}")
-    except pd.errors.EmptyDataError:
-        raise ValueError("File is empty")
+    df['processed_narrative'] = df['processed_narrative'].apply(preprocess_text)
 
+    # Remove rows where narrative is empty
+    df = df[df['processed_narrative'].str.strip() != '']
 
-def map_categorical_columns(df):
-    """Map integer values to categorical labels for InjuryLocationType and WeaponType1 if they exist in the DataFrame."""
-    if 'InjuryLocationType' in df.columns:
-        df['InjuryLocationType'] = df['InjuryLocationType'].map(injury_location_mapping)
-    if 'WeaponType1' in df.columns:
-        df['WeaponType1'] = df['WeaponType1'].map(weapon_type_mapping)
     return df
 
 
-def prepare_data(features_df, labels_df):
-    """Prepare data by combining narratives, preprocessing, and mapping categorical columns."""
-    features_df['processed_narrative'] = (features_df['NarrativeLE'].fillna('') + ' ' +
-                                          features_df['NarrativeCME'].fillna(''))
-    features_df['processed_narrative'] = features_df['processed_narrative'].apply(preprocess_text)
-    features_df['sentiment'] = features_df['processed_narrative'].apply(get_sentiment_score)
+def engineer_features(X_train, X_val=None, max_features=25000, n_components=250):
+    logging.info(f"Starting feature engineering with TF-IDF and TruncatedSVD.")
 
-    labels_df = map_categorical_columns(labels_df)
-    merged_df = pd.merge(features_df[['uid', 'processed_narrative', 'sentiment']], labels_df,
-                         on='uid', how='inner')
-    return merged_df
-
-
-def create_tfidf_features(texts, max_features=25000):
-    vectorizer = TfidfVectorizer(
+    tfidf = TfidfVectorizer(
         max_features=max_features,
         stop_words='english',
-        ngram_range=(1, 3),
-        min_df=3,
-        max_df=0.9,
-        sublinear_tf=True
+        ngram_range=(1, 2),
+        min_df=2,
+        sublinear_tf=True  # Often helps in reducing the impact of very frequent terms
     )
-    return vectorizer.fit_transform(texts), vectorizer
+
+    X_train_tfidf = tfidf.fit_transform(X_train)
+
+    svd = TruncatedSVD(n_components=min(n_components, X_train_tfidf.shape[1] - 1),
+                       random_state=42)
+    X_train_svd = svd.fit_transform(X_train_tfidf)
+
+    explained_var = svd.explained_variance_ratio_.sum()
+    logging.info(f"Explained variance ratio with SVD: {explained_var:.4f}")
+
+    if X_val is not None:
+        X_val_tfidf = tfidf.transform(X_val)
+        X_val_svd = svd.transform(X_val_tfidf)
+        return X_train_svd, X_val_svd, tfidf, svd
+
+    return X_train_svd, tfidf, svd
 
 
-def analyze_class_distribution(y, column_name):
-    """Analyze class distribution for a given column."""
-    class_counts = y[column_name].value_counts()
-    imbalance_ratio = class_counts.max() / class_counts.min()
+class MixedClassifier:
+    def __init__(self, categorical_cols, metric='f1', n_splits=5, seed=42, num_targets=None):
+        self.categorical_cols = categorical_cols
+        self.metric = metric
+        self.n_splits = n_splits
+        self.seed = seed
+        self.models = {}
+        self.num_targets = num_targets
 
-    print(f"\nClass Distribution for {column_name}:")
-    print(class_counts)
-    print(f"Imbalance Ratio: {imbalance_ratio:.2f}")
+    def get_metric(self, y_true, y_pred):
+        """Calculate metric for each target column individually and average them."""
+        # Ensure y_true and y_pred are DataFrames for consistent access
+        if isinstance(y_true, pd.Series):
+            y_true = y_true.to_frame()
+        if isinstance(y_pred, np.ndarray) and y_pred.ndim == 1:
+            y_pred = y_pred.reshape(-1, 1)
+        elif isinstance(y_pred, pd.Series):
+            y_pred = y_pred.to_frame()
 
-    return imbalance_ratio, class_counts
-
-
-def handle_imbalance(X, y, class_counts, sampling_ratio=0.8):
-    """Handle class imbalance using a combination of undersampling and synthetic samples."""
-    majority_class = class_counts.index[0]
-    minority_class = class_counts.index[1]
-
-    # Get indices for each class
-    maj_indices = y[y == majority_class].index
-    min_indices = y[y == minority_class].index
-
-    # Undersample majority class
-    target_maj_samples = int(len(min_indices) / sampling_ratio)
-    maj_indices = np.random.choice(maj_indices, target_maj_samples, replace=False)
-
-    # Combine indices
-    balanced_indices = np.concatenate([maj_indices, min_indices])
-
-    return X[balanced_indices], y[balanced_indices]
-
-
-# def evaluate_predictions(y_true, y_pred, y_pred_proba, column_name):
-#     """Evaluate model predictions with focus on false positives."""
-#     conf_matrix = confusion_matrix(y_true, y_pred)
-#     tn, fp, fn, tp = conf_matrix.ravel()
-#
-#     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-#     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-#     f1 = f1_score(y_true, y_pred, average='binary')
-#     fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
-#     fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
-#
-#     print(f"\nMetrics for {column_name}:")
-#     print(f"Confusion Matrix:\n{conf_matrix}")
-#     print(f"Precision: {precision:.4f}")
-#     print(f"Recall: {recall:.4f}")
-#     print(f"F1 Score: {f1:.4f}")
-#     print(f"False Positive Rate (FPR): {fpr:.4f}")
-#     print(f"False Negative Rate (FNR): {fnr:.4f}")
-
-
-def calculate_optimal_threshold(y_true, y_pred_proba, metric='f1'):
-    """Enhanced threshold calculation with multiple metric options."""
-    if y_pred_proba.ndim == 1 or y_pred_proba.shape[1] == 2:
-        # Binary classification
-        thresholds = np.linspace(0, 1, 100)
         scores = []
-        for threshold in thresholds:
-            y_pred = (y_pred_proba >= threshold).astype(int)
-            if metric == 'f1':
-                score = f1_score(y_true, y_pred)
-            elif metric == 'balanced_accuracy':
-                score = balanced_accuracy_score(y_true, y_pred)
-            scores.append(score)
-        return thresholds[np.argmax(scores)]
-    else:
-        # Multiclass optimization
-        return calculate_optimal_threshold(y_true, y_pred_proba)
+        for i in range(y_true.shape[1]):  # Loop over each target column
+            col_y_true = y_true.iloc[:, i]
+            col_y_pred = y_pred[:, i]
 
-
-def train_and_evaluate_model(X, y):
-    """Enhanced model training with both XGBoost and Random Forest models."""
-    models = []
-    scores = []
-
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-    for col in tqdm(y.columns, desc="Training models"):
-        print(f"\n*****Processing {col}*****")
-
-        # Analyze class distribution
-        imbalance_ratio, class_counts = analyze_class_distribution(y, col)
-
-        label_encoder = LabelEncoder()
-        y_encoded = label_encoder.fit_transform(y[col])
-        n_classes = len(np.unique(y_encoded))
-
-        if n_classes < 2:
-            print(f"Skipping {col} due to insufficient class samples.")
-            continue
-
-        # Calculate class weights
-        class_counts_encoded = np.bincount(y_encoded)
-        class_weight = {
-            i: len(y_encoded) / (len(np.unique(y_encoded)) * count)
-            for i, count in enumerate(class_counts_encoded)
-        }
-
-        # Define models
-        rf_model = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=15,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            class_weight=class_weight,
-            random_state=42,
-            n_jobs=-1
-        )
-
-        xgb_model = xgb.XGBClassifier(
-            n_estimators=300,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.7,
-            colsample_bytree=0.7,
-            random_state=42,
-            objective='binary:logistic' if n_classes == 2 else 'multi:softprob',
-            num_class=n_classes if n_classes > 2 else None
-        )
-
-        models_list = [rf_model, xgb_model]
-
-        # Perform cross-validation
-        cv_scores = []
-        thresholds = []
-
-        for train_idx, val_idx in skf.split(X.toarray(), y_encoded):
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y_encoded[train_idx], y_encoded[val_idx]
-
-            # Handle imbalance if binary classification
-            if n_classes == 2 and imbalance_ratio > 3:
-                X_train_dense = X_train.toarray()
-                X_train_balanced, y_train_balanced = handle_imbalance(
-                    X_train_dense,
-                    pd.Series(y_train),
-                    pd.Series(y_train).value_counts()
-                )
-                X_train = csr_matrix(X_train_balanced)
-                y_train = y_train_balanced.values
-
-            # Train models and get predictions
-            predictions_proba = []
-            for model in models_list:
-                model.fit(X_train, y_train)
-                if n_classes == 2:
-                    pred_proba = model.predict_proba(X_val)[:, 1]
-                    predictions_proba.append(pred_proba)
-                else:
-                    pred_proba = model.predict_proba(X_val)
-                    predictions_proba.append(pred_proba)
-
-            # Ensemble predictions
-            if n_classes == 2:
-                # For binary classification
-                y_pred_proba = np.mean(predictions_proba, axis=0)
-                threshold = calculate_optimal_threshold(y_val, y_pred_proba)
-                y_pred = (y_pred_proba >= threshold).astype(int)
-                thresholds.append(threshold)
+            # Compute the metric for each column based on the specified metric
+            if self.metric == 'f1':
+                score = f1_score(col_y_true, col_y_pred, average='weighted')
+            elif self.metric == 'accuracy':
+                score = accuracy_score(col_y_true, col_y_pred)
+            elif self.metric == 'roc_auc':
+                score = roc_auc_score(col_y_true, col_y_pred, multi_class='ovr')
             else:
-                # For multiclass
-                y_pred_proba = np.mean(predictions_proba, axis=0)
-                y_pred = np.argmax(y_pred_proba, axis=1)
+                raise ValueError(f"Unsupported metric '{self.metric}'")
 
-            # Calculate and store scores
-            cv_scores.append(f1_score(y_val, y_pred, average='weighted'))
+            scores.append(score)
 
-            # Evaluate predictions
-            print(f"\nCross-validation fold results:")
-            print(classification_report(y_val, y_pred))
-            print("\nConfusion Matrix:")
-            print(confusion_matrix(y_val, y_pred))
+        # Return the average score across all target columns
+        return np.mean(scores)
 
-        # Train final models on full dataset
-        final_models = []
-        for model in models_list:
-            model.fit(X.toarray(), y_encoded)
-            final_models.append(model)
+    def train(self, X, y):
+        if self.num_targets is None:
+            self.num_targets = y.shape[1]
 
-        if len(final_models) == 1:
-            final_models = final_models[0]  # If only one model, don't wrap in a list
+        kfold = KFold(n_splits=self.n_splits, shuffle=True, random_state=self.seed)
+        oof_predictions = np.zeros(y.shape)
+        scores = []
 
-        final_threshold = np.mean(thresholds) if thresholds else None
-        models.append((final_models, label_encoder, final_threshold))
-        scores.append(np.mean(cv_scores))
+        for fold, (train_idx, val_idx) in enumerate(tqdm(kfold.split(X), desc="Training Folds")):
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
-        print(f"\nAverage CV Score for {col}: {np.mean(cv_scores):.4f}")
+            # MultiOutputClassifier for handling each binary/categorical target
+            model = MultiOutputClassifier(
+                RandomForestClassifier(n_estimators=100, random_state=self.seed, class_weight="balanced"))
+            model.fit(X_train, y_train)
+            self.models[fold] = model
 
-    return models, np.mean(scores)
+            # Predict on validation set
+            y_val_pred = model.predict(X_val)
+            oof_predictions[val_idx] = y_val_pred
 
+            # Average score across all target columns
+            fold_scores = [self.get_metric(y_val.iloc[:, i], y_val_pred[:, i]) for i in range(y.shape[1])]
+            avg_fold_score = np.mean(fold_scores)
+            scores.append(avg_fold_score)
+            logging.info(f"Fold {fold + 1} - Average {self.metric.upper()}: {avg_fold_score:.4f}")
 
-def make_predictions(models, X):
-    """Make predictions using the trained models."""
-    predictions = []
-    for model_tuple in models:
-        model_list, label_encoder, threshold = model_tuple
+        avg_score = np.mean(scores)
+        logging.info(f"Overall CV {self.metric.upper()}: {avg_score:.4f}")
+        return oof_predictions, avg_score
 
-        if not isinstance(model_list, list):
-            model_list = [model_list]  # Convert single model to list
+    def predict(self, X_test):
+        if self.num_targets is None:
+            raise ValueError("num_targets must be defined. Train the model first or specify it during initialization.")
 
-        predictions_proba = []
-        for model in model_list:
-            if hasattr(model, 'predict_proba'):
-                pred_proba = model.predict_proba(X)
-                if pred_proba.shape[1] == 2:  # Binary classification
-                    predictions_proba.append(pred_proba[:, 1])
-                else:  # Multiclass classification
-                    predictions_proba.append(pred_proba)
+        test_preds = np.zeros((X_test.shape[0], self.num_targets, self.n_splits))
 
-        if predictions_proba:
-            y_pred_proba = np.mean(predictions_proba, axis=0)
-            if y_pred_proba.ndim == 1 or y_pred_proba.shape[1] == 2:  # Binary classification
-                pred = (y_pred_proba >= threshold).astype(int)
-            else:  # Multiclass classification
-                pred = np.argmax(y_pred_proba, axis=1)
-        else:
-            pred = model_list[0].predict(X)
+        for fold, model in self.models.items():
+            test_preds[:, :, fold] = model.predict(X_test)
 
-        pred = label_encoder.inverse_transform(pred)
-        predictions.append(pred)
-
-    return np.column_stack(predictions)
+        return test_preds.mean(axis=2).round().astype(int)
 
 
-def save_submission(predictions, uids, columns, output_file):
-    """Save predictions to a submission file with UID as index."""
-    submission_df = pd.DataFrame(predictions, columns=columns)
-    submission_df['uid'] = uids
-    submission_df.set_index('uid', inplace=True)
-    submission_df.to_csv(output_file)
-    print(f"Submission saved to {output_file}")
+def predict_and_create_submission(model, X_test, tfidf, svd, test_features, submission_format_path, output_path, target_columns):
+    logging.info("Transforming test data and making predictions.")
+
+    # Prepare test data
+    test_features['processed_narrative'] = (
+        test_features['NarrativeLE'].fillna('') +
+        ' [SEP] ' +
+        test_features['NarrativeCME'].fillna('')
+    )
+    test_features['processed_narrative'] = test_features['processed_narrative'].apply(preprocess_text)
+
+    # Transform test data
+    X_test_tfidf = tfidf.transform(test_features['processed_narrative'])
+    X_test_svd = svd.transform(X_test_tfidf)
+
+    # Make predictions
+    predictions = model.predict(X_test_svd)
+
+    # Convert predictions to a DataFrame and add 'uid' column
+    predictions = pd.DataFrame(predictions, columns=target_columns)
+    predictions.insert(0, 'uid', test_features['uid'])
+
+    # Load submission format to ensure correct column order
+    submission_format = pd.read_csv(submission_format_path)
+    predictions = predictions[submission_format.columns]
+
+    # Save submission
+    predictions.to_csv(output_path, index=False)
+    logging.info(f"Submission saved to {output_path}")
+
+
 
 
 def main():
-    train_features_file = 'assets/train_features.csv'
-    train_labels_file = 'assets/train_labels.csv'
-    test_features_file = 'data/test_features.csv'
-    submission_format_file = 'data/submission_format.csv'
-    output_submission_file = 'submission.csv'
+    logging.info("Starting the pipeline.")
 
-    print("Loading and preparing training data...")
-    train_features_df, train_labels_df = load_data(train_features_file, train_labels_file)
-    train_df = prepare_data(train_features_df, train_labels_df)
+    # Load data
+    df = load_data('assets/train_features.csv', 'assets/train_labels.csv')
+    prepared_data = prepare_data(df)
 
-    print("Creating TF-IDF features...")
-    X_train, vectorizer = create_tfidf_features(train_df['processed_narrative'])
-    y_train = train_df.drop(['uid', 'processed_narrative', 'sentiment'], axis=1)
+    # Split features and labels
+    X = prepared_data['processed_narrative']
+    y = prepared_data.drop(columns=['uid', 'processed_narrative', 'NarrativeLE', 'NarrativeCME'])
+    y = y.apply(pd.to_numeric, errors='coerce').fillna(0)
 
-    print("Training and evaluating models...")
-    models, avg_score = train_and_evaluate_model(X_train, y_train)
+    # Train/test split
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    print("Loading and preparing test data...")
-    test_features_df, _ = load_data(test_features_file, None)
-    test_features_df['processed_narrative'] = (test_features_df['NarrativeLE'].fillna('') + ' ' +
-                                               test_features_df['NarrativeCME'].fillna(''))
-    test_features_df['processed_narrative'] = test_features_df['processed_narrative'].apply(preprocess_text)
-    test_features_df['sentiment'] = test_features_df['processed_narrative'].apply(get_sentiment_score)
+    # Engineer features
+    X_train_features, X_val_features, tfidf, svd = engineer_features(X_train, X_val)
 
-    X_test = vectorizer.transform(test_features_df['processed_narrative'])
+    # Train model
+    mixed_model = MixedClassifier(categorical_cols=CATEGORICAL_COLS, metric='f1', n_splits=5, seed=42)
+    oof_preds, avg_cv_score = mixed_model.train(X_train_features, y_train)
+    logging.info(f"Average cross-validation {mixed_model.metric.upper()}: {avg_cv_score:.4f}")
 
-    print("Making predictions...")
-    predictions = make_predictions(models, X_test)
+    # Validate model on held-out data
+    y_val_pred = mixed_model.predict(X_val_features)
+    val_scores = [mixed_model.get_metric(y_val.iloc[:, i], y_val_pred[:, i]) for i in range(y_val.shape[1])]
+    avg_val_score = np.mean(val_scores)
+    logging.info(f"Validation {mixed_model.metric.upper()}: {avg_val_score:.4f}")
 
-    submission_format_df = pd.read_csv(submission_format_file, index_col='uid')
-    save_submission(predictions, test_features_df['uid'], submission_format_df.columns, output_submission_file)
+    # Load and process test data
+    test_features = pd.read_csv('data/test_features.csv')
+    test_features['processed_narrative'] = (
+            test_features['NarrativeLE'].fillna('') + ' [SEP] ' + test_features['NarrativeCME'].fillna('')
+    )
+    test_features['processed_narrative'] = test_features['processed_narrative'].apply(preprocess_text)
+    X_test_tfidf = tfidf.transform(test_features['processed_narrative'])
+    X_test_svd = svd.transform(X_test_tfidf)
+
+    # Generate and save test predictions
+    # test_predictions = mixed_model.predict(X_test_svd)
+    predict_and_create_submission(
+        model=mixed_model,
+        X_test=X_test_svd,
+        tfidf=tfidf,
+        svd=svd,
+        test_features=test_features,
+        submission_format_path='data/submission_format.csv',
+        output_path='submission.csv',
+        target_columns=y_train.columns  # Pass the correct target columns
+    )
+
+    logging.info("Pipeline complete.")
 
 
 if __name__ == "__main__":
