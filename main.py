@@ -1,255 +1,259 @@
-import logging
-import re
 import numpy as np
 import pandas as pd
-from sklearn.decomposition import TruncatedSVD
-from sklearn.ensemble import RandomForestClassifier
+from imblearn.under_sampling import RandomUnderSampler
+from scipy.sparse import hstack, csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
-from sklearn.model_selection import train_test_split, KFold
-from sklearn.multioutput import MultiOutputClassifier
-from tqdm import tqdm
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_class_weight
+from xgboost import XGBClassifier
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Load the data
+train_features = pd.read_csv('assets/train_features.csv')
+train_labels = pd.read_csv('assets/train_labels.csv')
+test_features = pd.read_csv('data/test_features.csv')
 
-# Define categorical columns and their possible values
-CATEGORICAL_COLS = {
-    'InjuryLocationType': range(1, 7),  # 1-6
-    'WeaponType1': range(1, 13)  # 1-12
-}
-
-
-def load_data(features_path, labels_path):
-    logging.info(f"Loading data from {features_path} and {labels_path}")
-    features = pd.read_csv(features_path)
-    labels = pd.read_csv(labels_path)
-    return pd.merge(features, labels, on='uid', how='inner')
+# Create combined narratives first
+print("Creating combined narratives...")
+train_features['combined_narrative'] = train_features['NarrativeLE'] + ' ' + train_features['NarrativeCME']
+test_features['combined_narrative'] = test_features['NarrativeLE'] + ' ' + test_features['NarrativeCME']
 
 
-def preprocess_text(text):
-    if pd.isna(text):
-        return ''
-    text = str(text).lower()
-    # Keep some punctuation that might be meaningful
-    text = re.sub(r'[^a-z0-9\s\.\,\?\!]', '', text)
-    text = re.sub(r'\s\^xxxx+', ' ', text).strip()
-    return text
+def create_engineered_features(df):
+    """Create engineered features from the narrative text and other columns"""
+    features = []
+
+    # Text length features
+    features.append(df['combined_narrative'].str.len().values.reshape(-1, 1))
+    features.append(df['combined_narrative'].str.split().str.len().values.reshape(-1, 1))
+
+    # Specific content indicators
+    disclosure_keywords = ['told', 'said', 'mentioned', 'expressed', 'talked', 'discussed', 'confided', 'shared',
+                           'revealed']
+    features.append(df['combined_narrative'].apply(
+        lambda x: sum(1 for word in str(x).lower().split() if word in disclosure_keywords)
+    ).values.reshape(-1, 1))
+
+    family_keywords = ['family', 'mother', 'father', 'sister', 'brother', 'daughter', 'son',
+                       'wife', 'husband', 'spouse', 'parent', 'child', 'sibling']
+    features.append(df['combined_narrative'].apply(
+        lambda x: sum(1 for word in str(x).lower().split() if word in family_keywords)
+    ).values.reshape(-1, 1))
+
+    friend_keywords = ['friend', 'colleague', 'coworker', 'neighbor', 'peer', 'acquaintance',
+                       'buddy', 'companion', 'roommate', 'classmate']
+    features.append(df['combined_narrative'].apply(
+        lambda x: sum(1 for word in str(x).lower().split() if word in friend_keywords)
+    ).values.reshape(-1, 1))
+
+    # Emotional content indicators
+    emotion_keywords = ['depressed', 'sad', 'angry', 'upset', 'stressed', 'anxious', 'worried',
+                        'frustrated', 'hopeless', 'helpless', 'lonely', 'isolated']
+    features.append(df['combined_narrative'].apply(
+        lambda x: sum(1 for word in str(x).lower().split() if word in emotion_keywords)
+    ).values.reshape(-1, 1))
+
+    # Communication method indicators
+    communication_keywords = ['text', 'call', 'phone', 'message', 'email', 'letter', 'note',
+                              'wrote', 'called', 'texted', 'messaged', 'contacted']
+    features.append(df['combined_narrative'].apply(
+        lambda x: sum(1 for word in str(x).lower().split() if word in communication_keywords)
+    ).values.reshape(-1, 1))
+
+    # Time indicators
+    time_keywords = ['today', 'yesterday', 'week', 'month', 'recent', 'lately', 'previously']
+    features.append(df['combined_narrative'].apply(
+        lambda x: sum(1 for word in str(x).lower().split() if word in time_keywords)
+    ).values.reshape(-1, 1))
+
+    # Stack all features horizontally
+    feature_matrix = np.hstack(features)
+
+    # Scale the features
+    scaler = StandardScaler()
+    feature_matrix = scaler.fit_transform(feature_matrix)
+
+    return csr_matrix(feature_matrix)
 
 
-def prepare_data(df):
-    """Prepare data by combining narratives and preprocessing."""
-    df = df.copy()
+# Create TF-IDF vectors
+print("Creating TF-IDF features...")
+vectorizer = TfidfVectorizer(
+    max_features=20000,
+    stop_words='english',
+    ngram_range=(1, 3),
+    min_df=2,
+    max_df=0.95,
+    sublinear_tf=True
+)
 
-    # Combine narratives with special separator
-    df['processed_narrative'] = (df['NarrativeLE'].fillna('') +
-                                 ' [SEP] ' +
-                                 df['NarrativeCME'].fillna(''))
+# Process training data
+print("Processing training data...")
+X_train_tfidf = vectorizer.fit_transform(train_features['combined_narrative'])
+train_engineered = create_engineered_features(train_features)
+X_train = hstack([X_train_tfidf, train_engineered])
 
-    df['processed_narrative'] = df['processed_narrative'].apply(preprocess_text)
+# Process test data
+print("Processing test data...")
+X_test_tfidf = vectorizer.transform(test_features['combined_narrative'])
+test_engineered = create_engineered_features(test_features)
+X_test = hstack([X_test_tfidf, test_engineered])
 
-    # Remove rows where narrative is empty
-    df = df[df['processed_narrative'].str.strip() != '']
+# Define the columns
+binary_columns = [
+    'DepressedMood', 'MentalIllnessTreatmentCurrnt', 'HistoryMentalIllnessTreatmnt',
+    'SuicideAttemptHistory', 'SuicideThoughtHistory', 'SubstanceAbuseProblem',
+    'MentalHealthProblem', 'DiagnosisAnxiety', 'DiagnosisDepressionDysthymia',
+    'DiagnosisBipolar', 'DiagnosisAdhd', 'IntimatePartnerProblem',
+    'FamilyRelationship', 'Argument', 'SchoolProblem', 'RecentCriminalLegalProblem',
+    'SuicideNote', 'SuicideIntentDisclosed', 'DisclosedToIntimatePartner',
+    'DisclosedToOtherFamilyMember', 'DisclosedToFriend'
+]
 
-    return df
+categorical_columns = ['InjuryLocationType', 'WeaponType1']
 
 
-def engineer_features(X_train, X_val=None, max_features=25000, n_components=250):
-    logging.info(f"Starting feature engineering with TF-IDF and TruncatedSVD.")
+# Enhanced binary classification with undersampling
+print("Training binary classification models with undersampling...")
+binary_predictions = {}
 
-    tfidf = TfidfVectorizer(
-        max_features=max_features,
-        stop_words='english',
-        ngram_range=(1, 2),
-        min_df=2,
-        sublinear_tf=True  # Often helps in reducing the impact of very frequent terms
+for col in binary_columns:
+    print(f"\nTraining model for {col}")
+    y = train_labels[col]
+
+    # Initialize the undersampler
+    undersampler = RandomUnderSampler(sampling_strategy='auto', random_state=42)
+    X_resampled, y_resampled = undersampler.fit_resample(X_train, y)
+
+    # Display class distribution after undersampling
+    print(f"Class distribution for {col} after undersampling: {dict(zip(*np.unique(y_resampled, return_counts=True)))}")
+
+    # Calculate class weights for the resampled data
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_resampled), y=y_resampled)
+    class_weight_dict = dict(zip(np.unique(y_resampled), class_weights))
+
+    # Define model parameters with class weights
+    if col.startswith('Disclosed'):
+        # Custom parameters for disclosure-related columns
+        params = {
+            'objective': 'binary:logistic',
+            'max_depth': 8,
+            'min_child_weight': 1,
+            'subsample': 0.9,
+            'colsample_bytree': 0.9,
+            'learning_rate': 0.005,
+            'n_estimators': 300,
+            'scale_pos_weight': class_weight_dict[1] / class_weight_dict[0],
+            'tree_method': 'hist'
+        }
+    else:
+        # Default parameters for other columns
+        params = {
+            'objective': 'binary:logistic',
+            'max_depth': 6,
+            'min_child_weight': 1,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'learning_rate': 0.01,
+            'n_estimators': 200,
+            'scale_pos_weight': class_weight_dict[1] / class_weight_dict[0],
+            'tree_method': 'hist'
+        }
+
+    # Initialize and train the model
+    binary_model = XGBClassifier(**params)
+
+    # Cross-validation with the undersampled data
+    cv_scores = cross_val_score(
+        binary_model, X_resampled, y_resampled,
+        cv=StratifiedKFold(n_splits=5),
+        scoring='f1'
+    )
+    print(
+        f"Cross-validation F1 scores for {col} after undersampling: {cv_scores.mean():.3f} (+/- {cv_scores.std() * 2:.3f})")
+
+    # Fit the model on the resampled data
+    binary_model.fit(X_resampled, y_resampled)
+
+    # Predict on the test data
+    binary_predictions[col] = binary_model.predict(X_test)
+
+
+# Train categorical models
+def train_categorical_model(X, y, model_name):
+    print(f"\nTraining {model_name}...")
+
+    class_weights = compute_class_weight('balanced', classes=np.unique(y), y=y)
+    weight_dict = dict(zip(np.unique(y), class_weights))
+    sample_weights = np.array([weight_dict[cls] for cls in y])
+
+    model = XGBClassifier(
+        objective='multi:softmax',
+        num_class=len(np.unique(y)),
+        max_depth=7,
+        min_child_weight=1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        learning_rate=0.01,
+        n_estimators=300,
+        tree_method='hist'
     )
 
-    X_train_tfidf = tfidf.fit_transform(X_train)
-
-    svd = TruncatedSVD(n_components=min(n_components, X_train_tfidf.shape[1] - 1),
-                       random_state=42)
-    X_train_svd = svd.fit_transform(X_train_tfidf)
-
-    explained_var = svd.explained_variance_ratio_.sum()
-    logging.info(f"Explained variance ratio with SVD: {explained_var:.4f}")
-
-    if X_val is not None:
-        X_val_tfidf = tfidf.transform(X_val)
-        X_val_svd = svd.transform(X_val_tfidf)
-        return X_train_svd, X_val_svd, tfidf, svd
-
-    return X_train_svd, tfidf, svd
-
-
-class MixedClassifier:
-    def __init__(self, categorical_cols, metric='f1', n_splits=5, seed=42, num_targets=None):
-        self.categorical_cols = categorical_cols
-        self.metric = metric
-        self.n_splits = n_splits
-        self.seed = seed
-        self.models = {}
-        self.num_targets = num_targets
-
-    def get_metric(self, y_true, y_pred):
-        """Calculate metric for each target column individually and average them."""
-        # Ensure y_true and y_pred are DataFrames for consistent access
-        if isinstance(y_true, pd.Series):
-            y_true = y_true.to_frame()
-        if isinstance(y_pred, np.ndarray) and y_pred.ndim == 1:
-            y_pred = y_pred.reshape(-1, 1)
-        elif isinstance(y_pred, pd.Series):
-            y_pred = y_pred.to_frame()
-
-        scores = []
-        for i in range(y_true.shape[1]):  # Loop over each target column
-            col_y_true = y_true.iloc[:, i]
-            col_y_pred = y_pred[:, i]
-
-            # Compute the metric for each column based on the specified metric
-            if self.metric == 'f1':
-                score = f1_score(col_y_true, col_y_pred, average='weighted')
-            elif self.metric == 'accuracy':
-                score = accuracy_score(col_y_true, col_y_pred)
-            elif self.metric == 'roc_auc':
-                score = roc_auc_score(col_y_true, col_y_pred, multi_class='ovr')
-            else:
-                raise ValueError(f"Unsupported metric '{self.metric}'")
-
-            scores.append(score)
-
-        # Return the average score across all target columns
-        return np.mean(scores)
-
-    def train(self, X, y):
-        if self.num_targets is None:
-            self.num_targets = y.shape[1]
-
-        kfold = KFold(n_splits=self.n_splits, shuffle=True, random_state=self.seed)
-        oof_predictions = np.zeros(y.shape)
-        scores = []
-
-        for fold, (train_idx, val_idx) in enumerate(tqdm(kfold.split(X), desc="Training Folds")):
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-
-            # MultiOutputClassifier for handling each binary/categorical target
-            model = MultiOutputClassifier(
-                RandomForestClassifier(n_estimators=100, random_state=self.seed, class_weight="balanced"))
-            model.fit(X_train, y_train)
-            self.models[fold] = model
-
-            # Predict on validation set
-            y_val_pred = model.predict(X_val)
-            oof_predictions[val_idx] = y_val_pred
-
-            # Average score across all target columns
-            fold_scores = [self.get_metric(y_val.iloc[:, i], y_val_pred[:, i]) for i in range(y.shape[1])]
-            avg_fold_score = np.mean(fold_scores)
-            scores.append(avg_fold_score)
-            logging.info(f"Fold {fold + 1} - Average {self.metric.upper()}: {avg_fold_score:.4f}")
-
-        avg_score = np.mean(scores)
-        logging.info(f"Overall CV {self.metric.upper()}: {avg_score:.4f}")
-        return oof_predictions, avg_score
-
-    def predict(self, X_test):
-        if self.num_targets is None:
-            raise ValueError("num_targets must be defined. Train the model first or specify it during initialization.")
-
-        test_preds = np.zeros((X_test.shape[0], self.num_targets, self.n_splits))
-
-        for fold, model in self.models.items():
-            test_preds[:, :, fold] = model.predict(X_test)
-
-        return test_preds.mean(axis=2).round().astype(int)
-
-
-def predict_and_create_submission(model, X_test, tfidf, svd, test_features, submission_format_path, output_path, target_columns):
-    logging.info("Transforming test data and making predictions.")
-
-    # Prepare test data
-    test_features['processed_narrative'] = (
-        test_features['NarrativeLE'].fillna('') +
-        ' [SEP] ' +
-        test_features['NarrativeCME'].fillna('')
+    cv_scores = cross_val_score(
+        model, X, y,
+        cv=StratifiedKFold(n_splits=5),
+        scoring='f1_weighted'
     )
-    test_features['processed_narrative'] = test_features['processed_narrative'].apply(preprocess_text)
+    print(f"Cross-validation F1 scores: {cv_scores.mean():.3f} (+/- {cv_scores.std() * 2:.3f})")
 
-    # Transform test data
-    X_test_tfidf = tfidf.transform(test_features['processed_narrative'])
-    X_test_svd = svd.transform(X_test_tfidf)
-
-    # Make predictions
-    predictions = model.predict(X_test_svd)
-
-    # Convert predictions to a DataFrame and add 'uid' column
-    predictions = pd.DataFrame(predictions, columns=target_columns)
-    predictions.insert(0, 'uid', test_features['uid'])
-
-    # Load submission format to ensure correct column order
-    submission_format = pd.read_csv(submission_format_path)
-    predictions = predictions[submission_format.columns]
-
-    # Save submission
-    predictions.to_csv(output_path, index=False)
-    logging.info(f"Submission saved to {output_path}")
+    model.fit(X, y, sample_weight=sample_weights)
+    return model.predict(X_test)
 
 
+# Train categorical models
+print("\nTraining categorical models...")
+injury_location_pred = train_categorical_model(
+    X_train,
+    train_labels['InjuryLocationType'] - 1,
+    'Injury Location'
+) + 1
 
+weapon_type_pred = train_categorical_model(
+    X_train,
+    train_labels['WeaponType1'] - 1,
+    'Weapon Type'
+) + 1
 
-def main():
-    logging.info("Starting the pipeline.")
+# Ensure uid alignment between test features and submission format
+submission_format = pd.read_csv('data/submission_format.csv')
+submission = pd.DataFrame({'uid': test_features['uid']})
 
-    # Load data
-    df = load_data('assets/train_features.csv', 'assets/train_labels.csv')
-    prepared_data = prepare_data(df)
+# Add predictions for binary columns to the submission DataFrame
+for col in binary_columns:
+    if col in binary_predictions:
+        submission[col] = binary_predictions[col]
+    else:
+        submission[col] = 0  # Default to 0 if prediction is missing
 
-    # Split features and labels
-    X = prepared_data['processed_narrative']
-    y = prepared_data.drop(columns=['uid', 'processed_narrative', 'NarrativeLE', 'NarrativeCME'])
-    y = y.apply(pd.to_numeric, errors='coerce').fillna(0)
+# Add categorical predictions
+submission['InjuryLocationType'] = injury_location_pred
+submission['WeaponType1'] = weapon_type_pred
 
-    # Train/test split
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+# Ensure all columns in the submission format are present in `submission`
+submission = submission_format[['uid']].merge(submission, on='uid', how='left')
 
-    # Engineer features
-    X_train_features, X_val_features, tfidf, svd = engineer_features(X_train, X_val)
+# Verify column and row alignment by ensuring each submission column exists and is in the right order
+for col in submission_format.columns:
+    if col not in submission.columns:
+        submission[col] = 0  # Add missing columns and set default values
+    else:
+        submission[col].fillna(0, inplace=True)  # Fill any NaN values with 0
 
-    # Train model
-    mixed_model = MixedClassifier(categorical_cols=CATEGORICAL_COLS, metric='f1', n_splits=5, seed=42)
-    oof_preds, avg_cv_score = mixed_model.train(X_train_features, y_train)
-    logging.info(f"Average cross-validation {mixed_model.metric.upper()}: {avg_cv_score:.4f}")
+# Ensure correct data types
+for col in submission.columns:
+    if col != 'uid':
+        submission[col] = submission[col].astype(int)
 
-    # Validate model on held-out data
-    y_val_pred = mixed_model.predict(X_val_features)
-    val_scores = [mixed_model.get_metric(y_val.iloc[:, i], y_val_pred[:, i]) for i in range(y_val.shape[1])]
-    avg_val_score = np.mean(val_scores)
-    logging.info(f"Validation {mixed_model.metric.upper()}: {avg_val_score:.4f}")
-
-    # Load and process test data
-    test_features = pd.read_csv('data/test_features.csv')
-    test_features['processed_narrative'] = (
-            test_features['NarrativeLE'].fillna('') + ' [SEP] ' + test_features['NarrativeCME'].fillna('')
-    )
-    test_features['processed_narrative'] = test_features['processed_narrative'].apply(preprocess_text)
-    X_test_tfidf = tfidf.transform(test_features['processed_narrative'])
-    X_test_svd = svd.transform(X_test_tfidf)
-
-    # Generate and save test predictions
-    # test_predictions = mixed_model.predict(X_test_svd)
-    predict_and_create_submission(
-        model=mixed_model,
-        X_test=X_test_svd,
-        tfidf=tfidf,
-        svd=svd,
-        test_features=test_features,
-        submission_format_path='data/submission_format.csv',
-        output_path='submission.csv',
-        target_columns=y_train.columns  # Pass the correct target columns
-    )
-
-    logging.info("Pipeline complete.")
-
-
-if __name__ == "__main__":
-    main()
+# Save the final submission
+submission.to_csv('submission.csv', index=False)
+print("\nSubmission file created successfully and verified for correct structure!")
